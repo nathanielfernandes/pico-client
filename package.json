@@ -1,0 +1,39 @@
+{
+  "name": "pico-client",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./admin": "./src/admin.ts",
+    "./react": "./src/react.ts",
+    "./svelte": "./src/svelte.svelte.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "svelte": ">=5"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "svelte": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "@types/bun": "^1.2.0",
+    "@types/react": "^19.2.14",
+    "react": "^19.2.5",
+    "svelte": "^5.0.0"
+  }
+}
