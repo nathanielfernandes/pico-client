@@ -35,3 +35,14 @@ export function base64ToUint8(b64: string): Uint8Array {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
+
+export const CsvStringArray: Serializer<string[]> = {
+  encode(value: string[]): Uint8Array {
+    return te.encode(value.join(","));
+  },
+  decode(data: Uint8Array<ArrayBufferLike>): string[] {
+    const str = td.decode(data);
+    if (str.length === 0) return [];
+    return str.split(",");
+  },
+};

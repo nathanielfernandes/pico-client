@@ -15,27 +15,17 @@ import type {
   StoreHandler,
 } from "./types.js";
 import { PicoError } from "./errors.js";
-import { Json } from "./serializers.js";
+import { Json, CsvStringArray } from "./serializers.js";
 import { Encoder, decodeResponse } from "./protocol.js";
 import { Store } from "./store.js";
 import { ListStore } from "./list-store.js";
 import { MapStore } from "./map-store.js";
+import { MultiStore } from "./multistore.js";
 
 const PING_INTERVAL = 30_000;
 const PING_FRAME = new Uint8Array([0x08]);
 
 const NAMESPACE_LIST_STORE = "@stores";
-
-const CsvStringArray: Serializer<string[]> = {
-  encode(value: string[]): Uint8Array {
-    return new TextEncoder().encode(value.join(","));
-  },
-  decode(data: Uint8Array<ArrayBufferLike>): string[] {
-    const str = new TextDecoder().decode(data);
-    if (str.length === 0) return [];
-    return str.split(",");
-  },
-};
 
 type Resolver = {
   resolve: (resp: Response) => void;
@@ -201,6 +191,54 @@ export class Pico {
       serializer: CsvStringArray,
       default: [],
     }).readonly;
+  }
+
+  multistore<V>(
+    name: string,
+    options?: { serializer?: Serializer<V>; local?: boolean },
+  ): MultiStore<V, "store"> {
+    const localKey = options?.local
+      ? `__pico_local_${this._namespace}_${name}`
+      : undefined;
+    return new MultiStore<V, "store">(
+      this,
+      name,
+      "store",
+      options?.serializer as any,
+      localKey,
+    );
+  }
+
+  multilist<V>(
+    name: string,
+    options?: { serializer?: Serializer<V[]>; local?: boolean },
+  ): MultiStore<V, "list"> {
+    const localKey = options?.local
+      ? `__pico_local_${this._namespace}_${name}`
+      : undefined;
+    return new MultiStore<V, "list">(
+      this,
+      name,
+      "list",
+      options?.serializer as any,
+      localKey,
+    );
+  }
+
+  multimap<V>(
+    name: string,
+    options?: { serializer?: Serializer<V>; local?: boolean },
+  ): MultiStore<V, "map"> {
+    const localKey = options?.local
+      ? `__pico_local_${this._namespace}_${name}`
+      : undefined;
+    return new MultiStore<V, "map">(
+      this,
+      name,
+      "map",
+      options?.serializer as any,
+      localKey,
+    );
   }
 
   async deleteStore(name: string): Promise<void> {

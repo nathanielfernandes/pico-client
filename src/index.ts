@@ -5,6 +5,7 @@ export { Pico } from "./client.js";
 export { Store } from "./store.js";
 export { ListStore } from "./list-store.js";
 export { MapStore } from "./map-store.js";
+export { MultiStore } from "./multistore.js";
 
 // Errors
 export { PicoError } from "./errors.js";
