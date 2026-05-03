@@ -1,4 +1,9 @@
-import type { Serializer, StoreHandler, ReadonlyStore } from "./types.js";
+import type {
+  Serializer,
+  StoreHandler,
+  ReadonlyStore,
+  WriteOptions,
+} from "./types.js";
 import type { Pico } from "./client.js";
 import { uint8ToBase64, base64ToUint8 } from "./serializers.js";
 
@@ -16,6 +21,14 @@ export class Store<T> implements StoreHandler {
   private _readyResolve!: () => void;
   readonly ready: Promise<void>;
 
+  // ── debounced flush ──────────────────────────────────────────────
+  private _defaultDebounce: number;
+  private _flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private _flushWaiters: Array<{
+    resolve: () => void;
+    reject: (e: Error) => void;
+  }> = [];
+
   /** @internal */
   constructor(
     pico: Pico,
@@ -23,12 +36,14 @@ export class Store<T> implements StoreHandler {
     serializer: Serializer<T>,
     defaultValue?: T,
     localKey?: string,
+    defaultDebounce?: number,
   ) {
     this._pico = pico;
     this._name = name;
     this._serializer = serializer;
     this._localKey = localKey ?? null;
     this._value = defaultValue;
+    this._defaultDebounce = defaultDebounce ?? 0;
 
     if (this._localKey) {
       this._loadLocal();
@@ -53,13 +68,27 @@ export class Store<T> implements StoreHandler {
     return this;
   }
 
-  async set(value: T): Promise<void> {
+  async set(value: T, opts?: WriteOptions): Promise<void> {
+    const debounce = opts?.debounce ?? this._defaultDebounce;
+    if (debounce > 0) {
+      this._value = value;
+      this._notify();
+      this._saveLocalDebounced();
+      return this._scheduleFlush(debounce);
+    }
     const data = this._serializer.encode(value);
     await this._pico._exec(this._pico._encoder.set(this._name, data));
   }
 
-  async update(fn: (current: T | undefined) => T): Promise<void> {
-    await this.set(fn(this._value));
+  /**
+   * Svelte-style update: receives the current value, returns the next.
+   * Honors the same debounce options as `set`.
+   */
+  async update(
+    fn: (current: T | undefined) => T,
+    opts?: WriteOptions,
+  ): Promise<void> {
+    await this.set(fn(this._value), opts);
   }
 
   subscribe(cb: (value: T | undefined) => void): () => void {
@@ -100,10 +129,61 @@ export class Store<T> implements StoreHandler {
   }
 
   async delete(): Promise<void> {
+    this._cancelFlush();
     await this._pico.deleteStore(this._name);
     this._value = undefined;
     this._version = 0;
     this._notify();
+  }
+
+  /** Force any pending debounced write to flush now. */
+  async flush(): Promise<void> {
+    if (this._flushTimer === null) return;
+    clearTimeout(this._flushTimer);
+    this._flushTimer = null;
+    await this._doFlush();
+  }
+
+  private _scheduleFlush(delay: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this._flushWaiters.push({ resolve, reject });
+      // Arm only if no timer is already running. A burst of writes
+      // joins the existing window so we always flush at most once
+      // per `delay`, even under continuous load.
+      if (this._flushTimer === null) {
+        this._flushTimer = setTimeout(() => {
+          this._flushTimer = null;
+          this._doFlush();
+        }, delay);
+      }
+    });
+  }
+
+  private async _doFlush(): Promise<void> {
+    const waiters = this._flushWaiters;
+    this._flushWaiters = [];
+    if (this._value === undefined) {
+      for (const w of waiters) w.resolve();
+      return;
+    }
+    try {
+      const data = this._serializer.encode(this._value);
+      await this._pico._exec(this._pico._encoder.set(this._name, data));
+      for (const w of waiters) w.resolve();
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      for (const w of waiters) w.reject(e);
+    }
+  }
+
+  private _cancelFlush() {
+    if (this._flushTimer !== null) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+    }
+    const waiters = this._flushWaiters;
+    this._flushWaiters = [];
+    for (const w of waiters) w.resolve();
   }
 
   /** @internal */

@@ -154,7 +154,14 @@ export class Pico {
       const localKey = options?.local
         ? `__pico_local_${this._namespace}_${name}`
         : undefined;
-      s = new Store<T>(this, name, serializer, options?.default, localKey);
+      s = new Store<T>(
+        this,
+        name,
+        serializer,
+        options?.default,
+        localKey,
+        options?.debounce,
+      );
       this._stores.set(name, s);
     }
     return s as Store<T>;
@@ -167,7 +174,14 @@ export class Pico {
       const localKey = options?.local
         ? `__pico_local_${this._namespace}_${name}`
         : undefined;
-      s = new ListStore<T>(this, name, serializer, options?.default, localKey);
+      s = new ListStore<T>(
+        this,
+        name,
+        serializer,
+        options?.default,
+        localKey,
+        options?.debounce,
+      );
       this._stores.set(name, s);
     }
     return s as ListStore<T>;
@@ -180,7 +194,14 @@ export class Pico {
       const localKey = options?.local
         ? `__pico_local_${this._namespace}_${name}`
         : undefined;
-      s = new MapStore<V>(this, name, serializer, options?.default, localKey);
+      s = new MapStore<V>(
+        this,
+        name,
+        serializer,
+        options?.default,
+        localKey,
+        options?.debounce,
+      );
       this._stores.set(name, s);
     }
     return s as MapStore<V>;

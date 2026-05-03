@@ -20,6 +20,7 @@ export type {
   StoreOptions,
   CollectionStoreOptions,
   MapStoreOptions,
+  WriteOptions,
   ReadonlyStore,
   ReadonlyListStore,
   ReadonlyMapStore,

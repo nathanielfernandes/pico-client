@@ -1,4 +1,9 @@
-import type { Serializer, StoreHandler, ReadonlyListStore } from "./types.js";
+import type {
+  Serializer,
+  StoreHandler,
+  ReadonlyListStore,
+  WriteOptions,
+} from "./types.js";
 import type { Pico } from "./client.js";
 import {
   type EntrySpan,
@@ -25,6 +30,13 @@ export class ListStore<T> implements StoreHandler {
   private _readyResolve!: () => void;
   readonly ready: Promise<void>;
 
+  private _defaultDebounce: number;
+  private _flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private _flushWaiters: Array<{
+    resolve: () => void;
+    reject: (e: Error) => void;
+  }> = [];
+
   /** @internal */
   constructor(
     pico: Pico,
@@ -32,11 +44,13 @@ export class ListStore<T> implements StoreHandler {
     serializer: Serializer<T>,
     defaultItems?: T[],
     localKey?: string,
+    defaultDebounce?: number,
   ) {
     this._pico = pico;
     this._name = name;
     this._serializer = serializer;
     this._localKey = localKey ?? null;
+    this._defaultDebounce = defaultDebounce ?? 0;
     if (defaultItems) this._items = [...defaultItems];
     if (this._localKey) this._loadLocal();
     this.ready = new Promise((r) => {
@@ -75,6 +89,7 @@ export class ListStore<T> implements StoreHandler {
       () => this._items.length,
       0,
       items,
+      undefined,
     );
   }
 
@@ -87,10 +102,11 @@ export class ListStore<T> implements StoreHandler {
       () => Math.max(0, Math.min(index, this._items.length)),
       0,
       items,
+      undefined,
     );
   }
 
-  async removeAt(index: number, count = 1): Promise<void> {
+  async removeAt(index: number, count = 1, opts?: WriteOptions): Promise<void> {
     if (index < 0 || index >= this._spans.length) return;
     const empty = new Uint8Array(0);
     return this._spliceWithRetry(
@@ -103,10 +119,11 @@ export class ListStore<T> implements StoreHandler {
       () => index,
       Math.min(count, this._spans.length - index),
       [],
+      opts,
     );
   }
 
-  async setAt(index: number, value: T): Promise<void> {
+  async setAt(index: number, value: T, opts?: WriteOptions): Promise<void> {
     if (index < 0 || index >= this._spans.length) return;
     const encoded = encodeEntries([value], this._serializer);
     return this._spliceWithRetry(
@@ -116,14 +133,27 @@ export class ListStore<T> implements StoreHandler {
       () => index,
       1,
       [value],
+      opts,
     );
   }
 
   /** Partially update the item at `index`, merging `partial` into the existing value. */
-  patch(index: number, partial: Partial<T>): Promise<void> {
+  patch(
+    index: number,
+    partial: Partial<T>,
+    opts?: WriteOptions,
+  ): Promise<void> {
     const current = this._items[index];
     if (current === undefined) return Promise.resolve();
-    return this.setAt(index, { ...current, ...partial });
+    return this.setAt(index, { ...current, ...partial }, opts);
+  }
+
+  /**
+   * Svelte-style update: receives the current items, returns the next.
+   * Replaces the full list. Honors debounce options.
+   */
+  async update(fn: (current: T[]) => T[], opts?: WriteOptions): Promise<void> {
+    return this.set(fn(this._items), opts);
   }
 
   /**
@@ -138,7 +168,9 @@ export class ListStore<T> implements StoreHandler {
     itemIndexFn: () => number,
     itemDeleteCount: number,
     newItems: T[],
+    opts: WriteOptions | undefined,
   ): Promise<void> {
+    const debounce = opts?.debounce ?? this._defaultDebounce;
     // Compute offsets against current local state and apply immediately.
     const offset = offsetFn();
     const deleteCount = deleteCountFn();
@@ -150,8 +182,12 @@ export class ListStore<T> implements StoreHandler {
       itemIndexFn(),
       itemDeleteCount,
       newItems,
+      debounce > 0,
     );
 
+    if (debounce > 0) {
+      return this._scheduleFlush(debounce);
+    }
     // Fire the network request without blocking subsequent splices.
     return this._sendSplice(version, offset, deleteCount, data);
   }
@@ -191,8 +227,16 @@ export class ListStore<T> implements StoreHandler {
     }
   }
 
-  async set(items: T[]): Promise<void> {
+  async set(items: T[], opts?: WriteOptions): Promise<void> {
+    const debounce = opts?.debounce ?? this._defaultDebounce;
     const encoded = encodeEntries(items, this._serializer);
+    if (debounce > 0) {
+      this._raw = encoded;
+      this._reparse();
+      this._notify();
+      this._saveLocalDebounced();
+      return this._scheduleFlush(debounce);
+    }
     await this._pico._execOk(this._pico._encoder.set(this._name, encoded));
     // Apply locally — broadcast may not arrive if not subscribed
     this._raw = encoded;
@@ -203,10 +247,19 @@ export class ListStore<T> implements StoreHandler {
   }
 
   async delete(): Promise<void> {
+    this._cancelFlush();
     await this._pico.deleteStore(this._name);
     this._reset();
     this._clearLocal();
     this._notify();
+  }
+
+  /** Force any pending debounced write to flush now. */
+  async flush(): Promise<void> {
+    if (this._flushTimer === null) return;
+    clearTimeout(this._flushTimer);
+    this._flushTimer = null;
+    await this._doFlush();
   }
 
   async refresh(): Promise<void> {
@@ -317,6 +370,7 @@ export class ListStore<T> implements StoreHandler {
     itemIndex: number,
     itemDeleteCount: number,
     newItems: T[],
+    debounced: boolean,
   ) {
     this._raw = applySpliceToBuffer(
       this._raw,
@@ -354,7 +408,10 @@ export class ListStore<T> implements StoreHandler {
       this._spans[i].end += sizeDelta;
     }
 
-    this._version++;
+    // When debouncing, the network flush will be a single `set` (one server
+    // version bump). Don't optimistically increment locally or we'd reject
+    // the broadcast that comes back.
+    if (!debounced) this._version++;
     this._notify();
     this._saveLocalDebounced();
   }
@@ -483,5 +540,39 @@ export class ListStore<T> implements StoreHandler {
       .catch(() => {
         this._serverSubscribed = false;
       });
+  }
+
+  private _scheduleFlush(delay: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this._flushWaiters.push({ resolve, reject });
+      if (this._flushTimer === null) {
+        this._flushTimer = setTimeout(() => {
+          this._flushTimer = null;
+          this._doFlush();
+        }, delay);
+      }
+    });
+  }
+
+  private async _doFlush(): Promise<void> {
+    const waiters = this._flushWaiters;
+    this._flushWaiters = [];
+    try {
+      await this._pico._execOk(this._pico._encoder.set(this._name, this._raw));
+      for (const w of waiters) w.resolve();
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      for (const w of waiters) w.reject(e);
+    }
+  }
+
+  private _cancelFlush() {
+    if (this._flushTimer !== null) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+    }
+    const waiters = this._flushWaiters;
+    this._flushWaiters = [];
+    for (const w of waiters) w.resolve();
   }
 }

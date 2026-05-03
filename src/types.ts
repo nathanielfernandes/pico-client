@@ -32,22 +32,39 @@ export interface PicoOptions {
   WebSocket?: typeof WebSocket;
 }
 
+/**
+ * Per-call options for mutating store methods.
+ *
+ * `debounce`: delay (ms) before the network flush. Subsequent debounced
+ * writes within the window reset the timer and coalesce. Local state is
+ * updated and subscribers notified immediately. `0` disables debounce.
+ */
+export interface WriteOptions {
+  debounce?: number;
+}
+
 export interface StoreOptions<T> {
   serializer?: Serializer<T>;
   default?: T;
   local?: boolean;
+  /** Default debounce (ms) applied to all writes unless overridden per-call. */
+  debounce?: number;
 }
 
 export interface CollectionStoreOptions<T> {
   serializer?: Serializer<T>;
   default?: T[];
   local?: boolean;
+  /** Default debounce (ms) applied to all writes unless overridden per-call. */
+  debounce?: number;
 }
 
 export interface MapStoreOptions<V> {
   serializer?: Serializer<V>;
   default?: Record<string, V>;
   local?: boolean;
+  /** Default debounce (ms) applied to all writes unless overridden per-call. */
+  debounce?: number;
 }
 
 export type ResponseOk = { tag: 0x00 };

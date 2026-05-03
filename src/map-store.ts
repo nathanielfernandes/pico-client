@@ -1,4 +1,9 @@
-import type { Serializer, StoreHandler, ReadonlyMapStore } from "./types.js";
+import type {
+  Serializer,
+  StoreHandler,
+  ReadonlyMapStore,
+  WriteOptions,
+} from "./types.js";
 import type { Pico } from "./client.js";
 import {
   type MapEntrySpan,
@@ -26,6 +31,13 @@ export class MapStore<V> implements StoreHandler {
   private _readyResolve!: () => void;
   readonly ready: Promise<void>;
 
+  private _defaultDebounce: number;
+  private _flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private _flushWaiters: Array<{
+    resolve: () => void;
+    reject: (e: Error) => void;
+  }> = [];
+
   /** @internal */
   constructor(
     pico: Pico,
@@ -33,11 +45,13 @@ export class MapStore<V> implements StoreHandler {
     serializer: Serializer<V>,
     defaults?: Record<string, V>,
     localKey?: string,
+    defaultDebounce?: number,
   ) {
     this._pico = pico;
     this._name = name;
     this._serializer = serializer;
     this._localKey = localKey ?? null;
+    this._defaultDebounce = defaultDebounce ?? 0;
     if (defaults) {
       for (const [k, v] of Object.entries(defaults)) {
         this._entries.set(k, v);
@@ -83,14 +97,28 @@ export class MapStore<V> implements StoreHandler {
     return this._entries.values();
   }
 
-  async set(key: string, value: V): Promise<void> {
+  async set(key: string, value: V, opts?: WriteOptions): Promise<void> {
     const encoded = encodeMapEntry(key, value, this._serializer);
-    return this._spliceWithRetry(key, encoded, value);
+    return this._spliceWithRetry(key, encoded, value, opts);
   }
 
-  async remove(key: string): Promise<void> {
+  async remove(key: string, opts?: WriteOptions): Promise<void> {
     if (!this._findSpan(key)) return;
-    return this._spliceWithRetry(key, new Uint8Array(0), undefined);
+    return this._spliceWithRetry(key, new Uint8Array(0), undefined, opts);
+  }
+
+  /**
+   * Svelte-style update for a single key: receives the current value, returns
+   * the next. Returning `undefined` removes the key. Honors debounce options.
+   */
+  async update(
+    key: string,
+    fn: (current: V | undefined) => V | undefined,
+    opts?: WriteOptions,
+  ): Promise<void> {
+    const next = fn(this._entries.get(key));
+    if (next === undefined) return this.remove(key, opts);
+    return this.set(key, next, opts);
   }
 
   /**
@@ -102,7 +130,9 @@ export class MapStore<V> implements StoreHandler {
     key: string,
     data: Uint8Array,
     value: V | undefined,
+    opts: WriteOptions | undefined,
   ): Promise<void> {
+    const debounce = opts?.debounce ?? this._defaultDebounce;
     const existing = this._findSpan(key);
     let offset: number;
     let byteDelete: number;
@@ -115,8 +145,9 @@ export class MapStore<V> implements StoreHandler {
       byteDelete = 0;
     }
     const version = this._version;
-    this._applySpliceAt(offset, byteDelete, data, key, value);
+    this._applySpliceAt(offset, byteDelete, data, key, value, debounce > 0);
 
+    if (debounce > 0) return this._scheduleFlush(debounce);
     return this._sendSplice(version, offset, byteDelete, data, key, value);
   }
 
@@ -155,7 +186,8 @@ export class MapStore<V> implements StoreHandler {
     }
   }
 
-  async setAll(entries: Record<string, V>): Promise<void> {
+  async setAll(entries: Record<string, V>, opts?: WriteOptions): Promise<void> {
+    const debounce = opts?.debounce ?? this._defaultDebounce;
     const parts: Uint8Array[] = [];
     let total = 0;
     for (const [key, value] of Object.entries(entries)) {
@@ -169,6 +201,13 @@ export class MapStore<V> implements StoreHandler {
       buf.set(part, pos);
       pos += part.length;
     }
+    if (debounce > 0) {
+      this._raw = buf;
+      this._reparse();
+      this._notify();
+      this._saveLocalDebounced();
+      return this._scheduleFlush(debounce);
+    }
     await this._pico._execOk(this._pico._encoder.set(this._name, buf));
     // Apply locally — broadcast may not arrive if not subscribed
     this._raw = buf;
@@ -179,10 +218,19 @@ export class MapStore<V> implements StoreHandler {
   }
 
   async delete(): Promise<void> {
+    this._cancelFlush();
     await this._pico.deleteStore(this._name);
     this._reset();
     this._clearLocal();
     this._notify();
+  }
+
+  /** Force any pending debounced write to flush now. */
+  async flush(): Promise<void> {
+    if (this._flushTimer === null) return;
+    clearTimeout(this._flushTimer);
+    this._flushTimer = null;
+    await this._doFlush();
   }
 
   async refresh(): Promise<void> {
@@ -292,6 +340,7 @@ export class MapStore<V> implements StoreHandler {
     byteData: Uint8Array,
     key: string,
     value: V | undefined,
+    debounced: boolean,
   ) {
     this._raw = applySpliceToBuffer(
       this._raw,
@@ -342,7 +391,10 @@ export class MapStore<V> implements StoreHandler {
       this._spanIndex.set(key, newIdx);
     }
 
-    this._version++;
+    // When debouncing, the network flush will be a single `set` (one server
+    // version bump). Don't optimistically increment locally or we'd reject
+    // the broadcast that comes back.
+    if (!debounced) this._version++;
     this._notify();
     this._saveLocalDebounced();
   }
@@ -489,5 +541,39 @@ export class MapStore<V> implements StoreHandler {
       .catch(() => {
         this._serverSubscribed = false;
       });
+  }
+
+  private _scheduleFlush(delay: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this._flushWaiters.push({ resolve, reject });
+      if (this._flushTimer === null) {
+        this._flushTimer = setTimeout(() => {
+          this._flushTimer = null;
+          this._doFlush();
+        }, delay);
+      }
+    });
+  }
+
+  private async _doFlush(): Promise<void> {
+    const waiters = this._flushWaiters;
+    this._flushWaiters = [];
+    try {
+      await this._pico._execOk(this._pico._encoder.set(this._name, this._raw));
+      for (const w of waiters) w.resolve();
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      for (const w of waiters) w.reject(e);
+    }
+  }
+
+  private _cancelFlush() {
+    if (this._flushTimer !== null) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+    }
+    const waiters = this._flushWaiters;
+    this._flushWaiters = [];
+    for (const w of waiters) w.resolve();
   }
 }
