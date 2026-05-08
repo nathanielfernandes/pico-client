@@ -43,19 +43,17 @@ export function encodeEntry(value: Uint8Array): Uint8Array {
   return buf;
 }
 
-export function encodeEntries<T>(
+export async function encodeEntries<T>(
   items: T[],
   serializer: Serializer<T>,
-): Uint8Array {
+): Promise<Uint8Array> {
   if (items.length === 0) return new Uint8Array(0);
 
-  // Pre-encode all items to calculate total size
-  const encoded: Uint8Array[] = new Array(items.length);
+  // Pre-encode all items in parallel to calculate total size
+  const encoded = await Promise.all(items.map((it) => serializer.encode(it)));
   let total = 0;
-  for (let i = 0; i < items.length; i++) {
-    const data = serializer.encode(items[i]);
-    encoded[i] = data;
-    total += varintSize(data.length) + data.length;
+  for (let i = 0; i < encoded.length; i++) {
+    total += varintSize(encoded[i].length) + encoded[i].length;
   }
 
   // Write directly into a single buffer
@@ -70,39 +68,48 @@ export function encodeEntries<T>(
   return buf;
 }
 
-export function parseListEntries<T>(
+export async function parseListEntries<T>(
   buf: Uint8Array<ArrayBufferLike>,
   serializer: Serializer<T>,
-): { items: T[]; spans: EntrySpan[]; corrupt: boolean } {
-  const items: T[] = [];
+): Promise<{ items: T[]; spans: EntrySpan[]; corrupt: boolean }> {
   const spans: EntrySpan[] = [];
+  const slices: Uint8Array<ArrayBufferLike>[] = [];
   let pos = 0;
+  let corrupt = false;
   try {
     while (pos < buf.length) {
       const start = pos;
       const len = decodeVarint(buf, pos);
       const end = len.pos + len.value;
-      if (end > buf.length) return { items, spans, corrupt: true };
-      const data = buf.subarray(len.pos, end);
-      items.push(serializer.decode(data));
+      if (end > buf.length) {
+        corrupt = true;
+        break;
+      }
+      slices.push(buf.subarray(len.pos, end));
       spans.push({ start, end });
       pos = end;
     }
   } catch {
-    return { items, spans, corrupt: true };
+    corrupt = true;
   }
-  return { items, spans, corrupt: false };
+  let items: T[];
+  try {
+    items = await Promise.all(slices.map((s) => serializer.decode(s)));
+  } catch {
+    return { items: [], spans, corrupt: true };
+  }
+  return { items, spans, corrupt };
 }
 
 // ── Map Entry Encoding/Decoding ─────────────────────────────────────
 
-export function encodeMapEntry<V>(
+export async function encodeMapEntry<V>(
   key: string,
   value: V,
   serializer: Serializer<V>,
-): Uint8Array {
+): Promise<Uint8Array> {
   const keyBytes = te.encode(key);
-  const valBytes = serializer.encode(value);
+  const valBytes = await serializer.encode(value);
   const keyLenSize = varintSize(keyBytes.length);
   const valLenSize = varintSize(valBytes.length);
   const buf = new Uint8Array(
@@ -116,33 +123,71 @@ export function encodeMapEntry<V>(
   return buf;
 }
 
-export function parseMapEntries<V>(
+export async function parseMapEntries<V>(
   buf: Uint8Array<ArrayBufferLike>,
   serializer: Serializer<V>,
-): { entries: Map<string, V>; spans: MapEntrySpan[]; corrupt: boolean } {
-  const entries = new Map<string, V>();
+): Promise<{ entries: Map<string, V>; spans: MapEntrySpan[]; corrupt: boolean }> {
   const spans: MapEntrySpan[] = [];
+  const keys: string[] = [];
+  const slices: Uint8Array<ArrayBufferLike>[] = [];
   let pos = 0;
+  let corrupt = false;
   try {
     while (pos < buf.length) {
       const start = pos;
       const keyLen = decodeVarint(buf, pos);
       const keyEnd = keyLen.pos + keyLen.value;
-      if (keyEnd > buf.length) return { entries, spans, corrupt: true };
+      if (keyEnd > buf.length) {
+        corrupt = true;
+        break;
+      }
       const key = td.decode(buf.subarray(keyLen.pos, keyEnd));
       pos = keyEnd;
       const valLen = decodeVarint(buf, pos);
       const valEnd = valLen.pos + valLen.value;
-      if (valEnd > buf.length) return { entries, spans, corrupt: true };
-      const valData = buf.subarray(valLen.pos, valEnd);
-      entries.set(key, serializer.decode(valData));
+      if (valEnd > buf.length) {
+        corrupt = true;
+        break;
+      }
+      keys.push(key);
+      slices.push(buf.subarray(valLen.pos, valEnd));
       spans.push({ key, start, end: valEnd });
       pos = valEnd;
     }
   } catch {
-    return { entries, spans, corrupt: true };
+    corrupt = true;
   }
-  return { entries, spans, corrupt: false };
+  let decoded: V[];
+  try {
+    decoded = await Promise.all(slices.map((s) => serializer.decode(s)));
+  } catch {
+    return { entries: new Map(), spans, corrupt: true };
+  }
+  const entries = new Map<string, V>();
+  for (let i = 0; i < keys.length; i++) entries.set(keys[i], decoded[i]);
+  return { entries, spans, corrupt };
+}
+
+/** Sync: walks list entries to compute spans only — does not decode values. */
+export function parseListSpans(buf: Uint8Array<ArrayBufferLike>): {
+  spans: EntrySpan[];
+  corrupt: boolean;
+} {
+  const spans: EntrySpan[] = [];
+  let pos = 0;
+  try {
+    while (pos < buf.length) {
+      const start = pos;
+      const len = decodeVarint(buf, pos);
+      const end = len.pos + len.value;
+      if (end > buf.length) return { spans, corrupt: true };
+      spans.push({ start, end });
+      pos = end;
+    }
+  } catch {
+    return { spans, corrupt: true };
+  }
+  return { spans, corrupt: false };
 }
 
 /** Walks varint-length-prefixed structure without deserializing values. */

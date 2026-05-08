@@ -44,6 +44,7 @@ type ConnState =
 const CONN_LOST = () => new PicoError(0, "connection lost");
 const CONN_CLOSED = () => new PicoError(0, "connection closed");
 const CONN_FAILED = () => new PicoError(0, "connection failed");
+const NS_CHANGED = () => new PicoError(0, "namespace changed");
 
 export class Pico {
   // ── identity ──────────────────────────────────────────────────────
@@ -145,6 +146,60 @@ export class Pico {
 
   close(): void {
     this._transition({ kind: "closed" });
+  }
+
+  get namespace(): string {
+    return this._namespace;
+  }
+
+  /**
+   * Switch this client to a different namespace. Tears down the current
+   * connection, resets every store (clearing values, swapping their local
+   * cache key, resetting `ready`), then reconnects. All existing store
+   * references stay valid — components subscribed to them will be
+   * notified with cleared state, then with the new namespace's data once
+   * the resubscribe completes.
+   */
+  async switchNamespace(namespace: string): Promise<void> {
+    if (this._namespace === namespace) {
+      if (this._state.kind === "open") return;
+      return this.connect();
+    }
+    const prev = this._state;
+    const wasOpen = prev.kind === "open";
+
+    this._stopPing();
+    if (prev.kind === "reconnecting") clearTimeout(prev.timer);
+    if (prev.kind === "open" || prev.kind === "connecting") {
+      try {
+        prev.ws.onopen = null;
+        prev.ws.onmessage = null;
+        prev.ws.onclose = null;
+        prev.ws.onerror = null;
+      } catch (_) {}
+      try {
+        prev.ws.close();
+      } catch (_) {}
+    }
+    if (prev.kind === "connecting") {
+      for (const w of prev.waiters) w.reject(NS_CHANGED());
+    }
+
+    // Requests in flight or queued targeted the old namespace.
+    this._rejectInflight(NS_CHANGED());
+    this._rejectBacklog(NS_CHANGED());
+
+    this._namespace = namespace;
+    for (const store of this._stores.values()) {
+      store._switchNamespace(namespace);
+    }
+
+    this._state = { kind: "idle" };
+    if (wasOpen) this._emitConnection(false);
+    this._reconnect = this._reconnectDefault;
+    this._nextDelay = this._initialDelay;
+
+    await this.connect();
   }
 
   store<T>(name: string, options?: StoreOptions<T>): Store<T> {

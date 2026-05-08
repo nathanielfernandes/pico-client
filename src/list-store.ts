@@ -10,12 +10,14 @@ import {
   applySpliceToBuffer,
   encodeEntries,
   parseListEntries,
+  parseListSpans,
 } from "./buffer.js";
 import { uint8ToBase64, base64ToUint8 } from "./serializers.js";
 import { PicoError } from "./errors.js";
 
 export class ListStore<T> implements StoreHandler {
   private _items: T[] = [];
+  private _default: T[];
   private _spans: EntrySpan[] = [];
   private _raw: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   private _version = 0;
@@ -28,10 +30,12 @@ export class ListStore<T> implements StoreHandler {
   private _localKey: string | null;
   private _localTimer: ReturnType<typeof setTimeout> | null = null;
   private _readyResolve!: () => void;
-  readonly ready: Promise<void>;
+  ready: Promise<void>;
 
+  // Leading + trailing debounce: see store.ts for semantics.
   private _defaultDebounce: number;
   private _flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private _pendingTrailing = false;
   private _flushWaiters: Array<{
     resolve: () => void;
     reject: (e: Error) => void;
@@ -51,6 +55,7 @@ export class ListStore<T> implements StoreHandler {
     this._serializer = serializer;
     this._localKey = localKey ?? null;
     this._defaultDebounce = defaultDebounce ?? 0;
+    this._default = defaultItems ? [...defaultItems] : [];
     if (defaultItems) this._items = [...defaultItems];
     if (this._localKey) this._loadLocal();
     this.ready = new Promise((r) => {
@@ -81,7 +86,7 @@ export class ListStore<T> implements StoreHandler {
   }
 
   async push(...items: T[]): Promise<void> {
-    const encoded = encodeEntries(items, this._serializer);
+    const encoded = await encodeEntries(items, this._serializer);
     return this._spliceWithRetry(
       () => this._raw.length,
       () => 0,
@@ -94,7 +99,7 @@ export class ListStore<T> implements StoreHandler {
   }
 
   async insertAt(index: number, ...items: T[]): Promise<void> {
-    const encoded = encodeEntries(items, this._serializer);
+    const encoded = await encodeEntries(items, this._serializer);
     return this._spliceWithRetry(
       () => this._byteOffset(index),
       () => 0,
@@ -125,7 +130,7 @@ export class ListStore<T> implements StoreHandler {
 
   async setAt(index: number, value: T, opts?: WriteOptions): Promise<void> {
     if (index < 0 || index >= this._spans.length) return;
-    const encoded = encodeEntries([value], this._serializer);
+    const encoded = await encodeEntries([value], this._serializer);
     return this._spliceWithRetry(
       () => this._spans[index].start,
       () => this._spans[index].end - this._spans[index].start,
@@ -229,10 +234,13 @@ export class ListStore<T> implements StoreHandler {
 
   async set(items: T[], opts?: WriteOptions): Promise<void> {
     const debounce = opts?.debounce ?? this._defaultDebounce;
-    const encoded = encodeEntries(items, this._serializer);
+    const encoded = await encodeEntries(items, this._serializer);
     if (debounce > 0) {
       this._raw = encoded;
-      this._reparse();
+      // Items are already decoded; just compute spans without re-decoding.
+      const parsed = parseListSpans(encoded);
+      this._items = items.slice();
+      this._spans = parsed.spans;
       this._notify();
       this._saveLocalDebounced();
       return this._scheduleFlush(debounce);
@@ -240,7 +248,9 @@ export class ListStore<T> implements StoreHandler {
     await this._pico._execOk(this._pico._encoder.set(this._name, encoded));
     // Apply locally — broadcast may not arrive if not subscribed
     this._raw = encoded;
-    this._reparse();
+    const parsed = parseListSpans(encoded);
+    this._items = items.slice();
+    this._spans = parsed.spans;
     this._version++;
     this._notify();
     this._saveLocalDebounced();
@@ -254,11 +264,13 @@ export class ListStore<T> implements StoreHandler {
     this._notify();
   }
 
-  /** Force any pending debounced write to flush now. */
+  /** Force any pending debounced trailing write to flush now. */
   async flush(): Promise<void> {
     if (this._flushTimer === null) return;
     clearTimeout(this._flushTimer);
     this._flushTimer = null;
+    if (!this._pendingTrailing) return;
+    this._pendingTrailing = false;
     await this._doFlush();
   }
 
@@ -268,7 +280,7 @@ export class ListStore<T> implements StoreHandler {
     );
     if (resp.version > this._version) {
       this._raw = resp.data;
-      if (!this._tryReparse()) {
+      if (!(await this._tryReparse())) {
         // Server has corrupt data — heal with local state if possible
         this._selfHeal();
         return;
@@ -295,21 +307,24 @@ export class ListStore<T> implements StoreHandler {
   }
 
   /** @internal */
-  _onUpdate(data: Uint8Array<ArrayBufferLike>, version: number) {
+  async _onUpdate(data: Uint8Array<ArrayBufferLike>, version: number) {
     if (version <= this._version) return;
+    const prevRaw = this._raw;
     this._raw = data;
-    if (!this._tryReparse()) {
+    if (!(await this._tryReparse())) {
       // Corrupt data from server — try to heal by pushing local state
+      this._raw = prevRaw;
       this._selfHeal();
       return;
     }
+    if (version <= this._version) return;
     this._version = version;
     this._notify();
     this._saveLocalDebounced();
   }
 
   /** @internal */
-  _onSpliceUpdate(
+  async _onSpliceUpdate(
     offset: number,
     deleteCount: number,
     data: Uint8Array<ArrayBufferLike>,
@@ -322,7 +337,7 @@ export class ListStore<T> implements StoreHandler {
     }
     const prevRaw = this._raw;
     this._raw = applySpliceToBuffer(this._raw, offset, deleteCount, data);
-    if (!this._tryReparse()) {
+    if (!(await this._tryReparse())) {
       // Splice produced corrupt data — restore and fetch clean state
       this._raw = prevRaw;
       this.refresh().catch(() => {});
@@ -353,6 +368,28 @@ export class ListStore<T> implements StoreHandler {
     this._serverSubscribe();
   }
 
+  /** @internal */
+  _switchNamespace(newNamespace: string) {
+    this._cancelFlush();
+    if (this._localTimer !== null) {
+      clearTimeout(this._localTimer);
+      this._localTimer = null;
+    }
+    if (this._localKey) {
+      this._localKey = `__pico_local_${newNamespace}_${this._name}`;
+    }
+    this._raw = new Uint8Array(0);
+    this._items = [...this._default];
+    this._spans = [];
+    this._version = 0;
+    this._serverSubscribed = false;
+    this.ready = new Promise((r) => {
+      this._readyResolve = r;
+    });
+    if (this._localKey) this._loadLocal();
+    this._notify();
+  }
+
   private _byteOffset(index: number): number {
     if (index <= 0) return 0;
     if (index >= this._spans.length) return this._raw.length;
@@ -380,20 +417,15 @@ export class ListStore<T> implements StoreHandler {
     );
     const sizeDelta = byteData.length - byteDeleteCount;
 
-    // Build spans for the newly inserted data
+    // Build spans for the newly inserted data (sync — just walks varints)
     const newSpans: EntrySpan[] = [];
     if (byteData.length > 0) {
-      // Parse only the inserted region to get spans
-      const parsed = parseListEntries(byteData, this._serializer);
+      const parsed = parseListSpans(byteData);
       for (const span of parsed.spans) {
         newSpans.push({
           start: span.start + byteOffset,
           end: span.end + byteOffset,
         });
-      }
-      // Use parsed items if we don't already have decoded values
-      if (newItems.length === 0 && parsed.items.length > 0) {
-        newItems = parsed.items;
       }
     }
 
@@ -416,8 +448,8 @@ export class ListStore<T> implements StoreHandler {
     this._saveLocalDebounced();
   }
 
-  private _tryReparse(): boolean {
-    const parsed = parseListEntries(this._raw, this._serializer);
+  private async _tryReparse(): Promise<boolean> {
+    const parsed = await parseListEntries(this._raw, this._serializer);
     if (parsed.corrupt) {
       return false;
     }
@@ -426,22 +458,20 @@ export class ListStore<T> implements StoreHandler {
     return true;
   }
 
-  private _reparse() {
-    const parsed = parseListEntries(this._raw, this._serializer);
-    this._items = parsed.items;
-    this._spans = parsed.spans;
-  }
-
   private _selfHeal() {
     if (this._items.length > 0) {
       // Re-encode items from the last known good state
-      const encoded = encodeEntries(this._items, this._serializer);
-      this._raw = encoded;
-      this._reparse();
-      // Push clean state to server
-      this._pico
-        ._execOk(this._pico._encoder.set(this._name, this._raw))
-        .catch(() => {});
+      const items = this._items.slice();
+      (async () => {
+        try {
+          const encoded = await encodeEntries(items, this._serializer);
+          this._raw = encoded;
+          this._spans = parseListSpans(encoded).spans;
+          await this._pico._execOk(
+            this._pico._encoder.set(this._name, this._raw),
+          );
+        } catch (_) {}
+      })();
     } else {
       // Nothing to recover from — reset to clean empty state.
       // Don't call refresh() here to avoid a loop if the server is also corrupt.
@@ -469,16 +499,19 @@ export class ListStore<T> implements StoreHandler {
     }
   }
 
-  private _loadLocal() {
+  private async _loadLocal() {
     if (!this._localKey || typeof globalThis.localStorage === "undefined")
       return;
     try {
       const raw = localStorage.getItem(this._localKey);
       if (!raw) return;
       const entry = JSON.parse(raw) as { v: number; d: string };
-      this._raw = base64ToUint8(entry.d);
+      // Don't clobber a newer version that may have arrived from the server
+      if (entry.v <= this._version) return;
+      const buf = base64ToUint8(entry.d);
+      this._raw = buf;
       this._version = entry.v;
-      if (!this._tryReparse()) {
+      if (!(await this._tryReparse())) {
         console.warn(
           `[pico] corrupt local cache for "${this._name}", clearing`,
         );
@@ -489,6 +522,7 @@ export class ListStore<T> implements StoreHandler {
         this._clearLocal();
         return;
       }
+      this._notify();
     } catch (err) {
       console.warn(
         `[pico] failed to load local cache for "${this._name}":`,
@@ -543,14 +577,21 @@ export class ListStore<T> implements StoreHandler {
   }
 
   private _scheduleFlush(delay: number): Promise<void> {
+    if (this._flushTimer === null) {
+      // Leading edge: arm cooldown, fire current state now.
+      this._flushTimer = setTimeout(() => {
+        this._flushTimer = null;
+        if (this._pendingTrailing) {
+          this._pendingTrailing = false;
+          this._doFlush();
+        }
+      }, delay);
+      return this._doFlush();
+    }
+    // Within cooldown: queue for the trailing flush.
+    this._pendingTrailing = true;
     return new Promise<void>((resolve, reject) => {
       this._flushWaiters.push({ resolve, reject });
-      if (this._flushTimer === null) {
-        this._flushTimer = setTimeout(() => {
-          this._flushTimer = null;
-          this._doFlush();
-        }, delay);
-      }
     });
   }
 
@@ -571,6 +612,7 @@ export class ListStore<T> implements StoreHandler {
       clearTimeout(this._flushTimer);
       this._flushTimer = null;
     }
+    this._pendingTrailing = false;
     const waiters = this._flushWaiters;
     this._flushWaiters = [];
     for (const w of waiters) w.resolve();

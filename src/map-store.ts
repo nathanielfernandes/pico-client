@@ -16,6 +16,7 @@ import { PicoError } from "./errors.js";
 
 export class MapStore<V> implements StoreHandler {
   private _entries = new Map<string, V>();
+  private _default: Map<string, V>;
   private _spans: MapEntrySpan[] = [];
   private _spanIndex = new Map<string, number>();
   private _raw: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -29,10 +30,12 @@ export class MapStore<V> implements StoreHandler {
   private _localKey: string | null;
   private _localTimer: ReturnType<typeof setTimeout> | null = null;
   private _readyResolve!: () => void;
-  readonly ready: Promise<void>;
+  ready: Promise<void>;
 
+  // Leading + trailing debounce: see store.ts for semantics.
   private _defaultDebounce: number;
   private _flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private _pendingTrailing = false;
   private _flushWaiters: Array<{
     resolve: () => void;
     reject: (e: Error) => void;
@@ -52,8 +55,10 @@ export class MapStore<V> implements StoreHandler {
     this._serializer = serializer;
     this._localKey = localKey ?? null;
     this._defaultDebounce = defaultDebounce ?? 0;
+    this._default = new Map();
     if (defaults) {
       for (const [k, v] of Object.entries(defaults)) {
+        this._default.set(k, v);
         this._entries.set(k, v);
       }
     }
@@ -98,7 +103,7 @@ export class MapStore<V> implements StoreHandler {
   }
 
   async set(key: string, value: V, opts?: WriteOptions): Promise<void> {
-    const encoded = encodeMapEntry(key, value, this._serializer);
+    const encoded = await encodeMapEntry(key, value, this._serializer);
     return this._spliceWithRetry(key, encoded, value, opts);
   }
 
@@ -188,13 +193,12 @@ export class MapStore<V> implements StoreHandler {
 
   async setAll(entries: Record<string, V>, opts?: WriteOptions): Promise<void> {
     const debounce = opts?.debounce ?? this._defaultDebounce;
-    const parts: Uint8Array[] = [];
+    const pairs = Object.entries(entries);
+    const parts = await Promise.all(
+      pairs.map(([k, v]) => encodeMapEntry(k, v, this._serializer)),
+    );
     let total = 0;
-    for (const [key, value] of Object.entries(entries)) {
-      const encoded = encodeMapEntry(key, value, this._serializer);
-      parts.push(encoded);
-      total += encoded.length;
-    }
+    for (const p of parts) total += p.length;
     const buf = new Uint8Array(total);
     let pos = 0;
     for (const part of parts) {
@@ -203,7 +207,7 @@ export class MapStore<V> implements StoreHandler {
     }
     if (debounce > 0) {
       this._raw = buf;
-      this._reparse();
+      await this._reparse();
       this._notify();
       this._saveLocalDebounced();
       return this._scheduleFlush(debounce);
@@ -211,7 +215,7 @@ export class MapStore<V> implements StoreHandler {
     await this._pico._execOk(this._pico._encoder.set(this._name, buf));
     // Apply locally — broadcast may not arrive if not subscribed
     this._raw = buf;
-    this._reparse();
+    await this._reparse();
     this._version++;
     this._notify();
     this._saveLocalDebounced();
@@ -225,11 +229,13 @@ export class MapStore<V> implements StoreHandler {
     this._notify();
   }
 
-  /** Force any pending debounced write to flush now. */
+  /** Force any pending debounced trailing write to flush now. */
   async flush(): Promise<void> {
     if (this._flushTimer === null) return;
     clearTimeout(this._flushTimer);
     this._flushTimer = null;
+    if (!this._pendingTrailing) return;
+    this._pendingTrailing = false;
     await this._doFlush();
   }
 
@@ -239,7 +245,7 @@ export class MapStore<V> implements StoreHandler {
     );
     if (resp.version > this._version) {
       this._raw = resp.data;
-      if (!this._tryReparse()) {
+      if (!(await this._tryReparse())) {
         // Server has corrupt data — heal with local state if possible
         this._selfHeal();
         return;
@@ -266,20 +272,23 @@ export class MapStore<V> implements StoreHandler {
   }
 
   /** @internal */
-  _onUpdate(data: Uint8Array<ArrayBufferLike>, version: number) {
+  async _onUpdate(data: Uint8Array<ArrayBufferLike>, version: number) {
     if (version <= this._version) return;
+    const prevRaw = this._raw;
     this._raw = data;
-    if (!this._tryReparse()) {
+    if (!(await this._tryReparse())) {
+      this._raw = prevRaw;
       this._selfHeal();
       return;
     }
+    if (version <= this._version) return;
     this._version = version;
     this._notify();
     this._saveLocalDebounced();
   }
 
   /** @internal */
-  _onSpliceUpdate(
+  async _onSpliceUpdate(
     offset: number,
     deleteCount: number,
     data: Uint8Array<ArrayBufferLike>,
@@ -292,7 +301,7 @@ export class MapStore<V> implements StoreHandler {
     }
     const prevRaw = this._raw;
     this._raw = applySpliceToBuffer(this._raw, offset, deleteCount, data);
-    if (!this._tryReparse()) {
+    if (!(await this._tryReparse())) {
       // Splice produced corrupt data — restore and fetch clean state
       this._raw = prevRaw;
       this.refresh().catch(() => {});
@@ -321,6 +330,29 @@ export class MapStore<V> implements StoreHandler {
     this._version = 0;
     this._serverSubscribed = false;
     this._serverSubscribe();
+  }
+
+  /** @internal */
+  _switchNamespace(newNamespace: string) {
+    this._cancelFlush();
+    if (this._localTimer !== null) {
+      clearTimeout(this._localTimer);
+      this._localTimer = null;
+    }
+    if (this._localKey) {
+      this._localKey = `__pico_local_${newNamespace}_${this._name}`;
+    }
+    this._raw = new Uint8Array(0);
+    this._entries = new Map(this._default);
+    this._spans = [];
+    this._spanIndex.clear();
+    this._version = 0;
+    this._serverSubscribed = false;
+    this.ready = new Promise((r) => {
+      this._readyResolve = r;
+    });
+    if (this._localKey) this._loadLocal();
+    this._notify();
   }
 
   private _findSpan(key: string): MapEntrySpan | undefined {
@@ -399,15 +431,15 @@ export class MapStore<V> implements StoreHandler {
     this._saveLocalDebounced();
   }
 
-  private _reparse() {
-    const parsed = parseMapEntries(this._raw, this._serializer);
+  private async _reparse() {
+    const parsed = await parseMapEntries(this._raw, this._serializer);
     this._entries = parsed.entries;
     this._spans = parsed.spans;
     this._rebuildIndex();
   }
 
-  private _tryReparse(): boolean {
-    const parsed = parseMapEntries(this._raw, this._serializer);
+  private async _tryReparse(): Promise<boolean> {
+    const parsed = await parseMapEntries(this._raw, this._serializer);
     if (parsed.corrupt) {
       return false;
     }
@@ -419,25 +451,28 @@ export class MapStore<V> implements StoreHandler {
 
   private _selfHeal() {
     if (this._entries.size > 0) {
-      // Re-encode from last known good entries
-      const parts: Uint8Array[] = [];
-      let total = 0;
-      for (const [key, value] of this._entries) {
-        const encoded = encodeMapEntry(key, value, this._serializer);
-        parts.push(encoded);
-        total += encoded.length;
-      }
-      const buf = new Uint8Array(total);
-      let pos = 0;
-      for (const part of parts) {
-        buf.set(part, pos);
-        pos += part.length;
-      }
-      this._raw = buf;
-      this._reparse();
-      this._pico
-        ._execOk(this._pico._encoder.set(this._name, this._raw))
-        .catch(() => {});
+      // Re-encode from last known good entries — snapshot first
+      const snapshot = Array.from(this._entries);
+      (async () => {
+        try {
+          const parts = await Promise.all(
+            snapshot.map(([k, v]) => encodeMapEntry(k, v, this._serializer)),
+          );
+          let total = 0;
+          for (const p of parts) total += p.length;
+          const buf = new Uint8Array(total);
+          let pos = 0;
+          for (const part of parts) {
+            buf.set(part, pos);
+            pos += part.length;
+          }
+          this._raw = buf;
+          await this._reparse();
+          await this._pico._execOk(
+            this._pico._encoder.set(this._name, this._raw),
+          );
+        } catch (_) {}
+      })();
     } else {
       // Nothing to recover from — reset to clean empty state.
       console.warn(
@@ -473,16 +508,18 @@ export class MapStore<V> implements StoreHandler {
     }
   }
 
-  private _loadLocal() {
+  private async _loadLocal() {
     if (!this._localKey || typeof globalThis.localStorage === "undefined")
       return;
     try {
       const raw = localStorage.getItem(this._localKey);
       if (!raw) return;
       const entry = JSON.parse(raw) as { v: number; d: string };
+      // Don't clobber a newer version that may have arrived from the server
+      if (entry.v <= this._version) return;
       this._raw = base64ToUint8(entry.d);
       this._version = entry.v;
-      if (!this._tryReparse()) {
+      if (!(await this._tryReparse())) {
         console.warn(
           `[pico] corrupt local cache for "${this._name}", clearing`,
         );
@@ -490,6 +527,7 @@ export class MapStore<V> implements StoreHandler {
         this._clearLocal();
         return;
       }
+      this._notify();
     } catch (err) {
       console.warn(
         `[pico] failed to load local cache for "${this._name}":`,
@@ -544,14 +582,21 @@ export class MapStore<V> implements StoreHandler {
   }
 
   private _scheduleFlush(delay: number): Promise<void> {
+    if (this._flushTimer === null) {
+      // Leading edge: arm cooldown, fire current state now.
+      this._flushTimer = setTimeout(() => {
+        this._flushTimer = null;
+        if (this._pendingTrailing) {
+          this._pendingTrailing = false;
+          this._doFlush();
+        }
+      }, delay);
+      return this._doFlush();
+    }
+    // Within cooldown: queue for the trailing flush.
+    this._pendingTrailing = true;
     return new Promise<void>((resolve, reject) => {
       this._flushWaiters.push({ resolve, reject });
-      if (this._flushTimer === null) {
-        this._flushTimer = setTimeout(() => {
-          this._flushTimer = null;
-          this._doFlush();
-        }, delay);
-      }
     });
   }
 
@@ -572,6 +617,7 @@ export class MapStore<V> implements StoreHandler {
       clearTimeout(this._flushTimer);
       this._flushTimer = null;
     }
+    this._pendingTrailing = false;
     const waiters = this._flushWaiters;
     this._flushWaiters = [];
     for (const w of waiters) w.resolve();

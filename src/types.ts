@@ -1,6 +1,6 @@
 export interface Serializer<T> {
-  encode(value: T): Uint8Array;
-  decode(data: Uint8Array<ArrayBufferLike>): T;
+  encode(value: T): Uint8Array | Promise<Uint8Array>;
+  decode(data: Uint8Array<ArrayBufferLike>): T | Promise<T>;
 }
 
 export interface ReconnectOptions {
@@ -35,9 +35,12 @@ export interface PicoOptions {
 /**
  * Per-call options for mutating store methods.
  *
- * `debounce`: delay (ms) before the network flush. Subsequent debounced
- * writes within the window reset the timer and coalesce. Local state is
- * updated and subscribers notified immediately. `0` disables debounce.
+ * `debounce`: leading + trailing window (ms). The first write in an idle
+ * period fires immediately; subsequent writes within `debounce` ms are
+ * coalesced into a single trailing flush at the end of the window. If the
+ * window expires with no further writes, no trailing flush fires. Local
+ * state is updated and subscribers notified immediately for every call.
+ * `0` disables debounce.
  */
 export interface WriteOptions {
   debounce?: number;
@@ -148,4 +151,5 @@ export interface StoreHandler {
   ): void;
   _onDeleted(): void;
   _resubscribe(): void;
+  _switchNamespace(newNamespace: string): void;
 }

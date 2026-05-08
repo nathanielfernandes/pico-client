@@ -4,9 +4,9 @@ export interface PicoAdminOptions {
 }
 
 export interface CreateTokenRequest {
-  namespace: string;
-  read_pattern?: string;
-  write_pattern?: string;
+  namespaces?: string[];
+  read_patterns?: string[];
+  write_patterns?: string[];
   manage_tokens?: boolean;
   create_namespaces?: boolean;
   admin?: boolean;
@@ -21,18 +21,28 @@ export interface CreateTokenRequest {
 export interface TokenSummary {
   id: number;
   token: string;
-  namespace: string;
+  namespaces: string[];
+  read_patterns: string[];
+  write_patterns: string[];
   manage_tokens: boolean;
   create_namespaces: boolean;
   admin: boolean;
   persist: boolean;
   view_stores: boolean;
-  read_pattern?: string;
-  write_pattern?: string;
   reads_per_sec?: number;
   writes_per_sec?: number;
   max_tokens?: number;
   max_namespaces?: number;
+}
+
+export interface TokenPage {
+  tokens: TokenSummary[];
+  next_after?: number;
+}
+
+export interface ListTokensParams {
+  after?: number;
+  limit?: number;
 }
 
 export interface CreateNamespaceRequest {
@@ -48,80 +58,67 @@ export class PicoAdmin {
     this._token = options.token;
   }
 
-  async createToken(request: CreateTokenRequest): Promise<TokenSummary> {
-    const res = await fetch(`${this._url}/api/tokens`, {
-      method: "POST",
+  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const res = await fetch(`${this._url}${path}`, {
+      ...init,
       headers: {
-        "Content-Type": "application/json",
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
         Authorization: `Bearer ${this._token}`,
+        ...(init?.headers ?? {}),
       },
-      body: JSON.stringify(request),
     });
     if (!res.ok) {
       throw new Error(`${res.status}: ${await res.text()}`);
     }
-    return res.json();
+    if (res.status === 204) {
+      return undefined as T;
+    }
+    return res.json() as Promise<T>;
+  }
+
+  async createToken(request: CreateTokenRequest): Promise<TokenSummary> {
+    return this.request("/api/tokens", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  async listTokensPage(params: ListTokensParams = {}): Promise<TokenPage> {
+    const q = new URLSearchParams();
+    if (params.after !== undefined) q.set("after", String(params.after));
+    if (params.limit !== undefined) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return this.request(`/api/tokens${qs ? `?${qs}` : ""}`);
   }
 
   async listTokens(): Promise<TokenSummary[]> {
-    const res = await fetch(`${this._url}/api/tokens`, {
-      headers: {
-        Authorization: `Bearer ${this._token}`,
-      },
-    });
-    if (!res.ok) {
-      throw new Error(`${res.status}: ${await res.text()}`);
+    const all: TokenSummary[] = [];
+    let after: number | undefined;
+    while (true) {
+      const page = await this.listTokensPage({ after, limit: 200 });
+      all.push(...page.tokens);
+      if (page.next_after === undefined || page.next_after === null) break;
+      after = page.next_after;
     }
-    return res.json();
+    return all;
   }
 
   async listStores(namespace: string): Promise<string[]> {
-    const res = await fetch(`${this._url}/api/stores/${namespace}`, {
-      headers: {
-        Authorization: `Bearer ${this._token}`,
-      },
-    });
-    if (!res.ok) {
-      throw new Error(`${res.status}: ${await res.text()}`);
-    }
-    return res.json();
+    return this.request(`/api/stores/${namespace}`);
   }
 
   async revokeToken(id: number): Promise<void> {
-    const res = await fetch(`${this._url}/api/tokens/${id}`, {
-      method: "DELETE",
-      headers: {
-        Authorization: `Bearer ${this._token}`,
-      },
-    });
-    if (!res.ok) {
-      throw new Error(`${res.status}: ${await res.text()}`);
-    }
+    await this.request<void>(`/api/tokens/${id}`, { method: "DELETE" });
   }
 
   async createNamespace(namespace: string, request: CreateNamespaceRequest): Promise<void> {
-    const res = await fetch(`${this._url}/api/namespaces/${namespace}`, {
+    await this.request<void>(`/api/namespaces/${namespace}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this._token}`,
-      },
       body: JSON.stringify(request),
     });
-    if (!res.ok) {
-      throw new Error(`${res.status}: ${await res.text()}`);
-    }
   }
 
   async deleteNamespace(namespace: string): Promise<void> {
-    const res = await fetch(`${this._url}/api/namespaces/${namespace}`, {
-      method: "DELETE",
-      headers: {
-        Authorization: `Bearer ${this._token}`,
-      },
-    });
-    if (!res.ok) {
-      throw new Error(`${res.status}: ${await res.text()}`);
-    }
+    await this.request<void>(`/api/namespaces/${namespace}`, { method: "DELETE" });
   }
 }

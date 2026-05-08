@@ -11,7 +11,14 @@ export { MultiStore } from "./multistore.js";
 export { PicoError } from "./errors.js";
 
 // Serializers
-export { Json, Raw } from "./serializers.js";
+export {
+  Json,
+  Raw,
+  CsvStringArray,
+  Encrypted,
+  deriveKeyFromPassphrase,
+} from "./serializers.js";
+export type { EncryptionKey } from "./serializers.js";
 
 // Types
 export type {

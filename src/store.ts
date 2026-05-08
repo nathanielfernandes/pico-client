@@ -9,6 +9,7 @@ import { uint8ToBase64, base64ToUint8 } from "./serializers.js";
 
 export class Store<T> implements StoreHandler {
   private _value: T | undefined;
+  private _default: T | undefined;
   private _version = 0;
   private _subs = new Set<(value: T | undefined) => void>();
   private _deleteSubs = new Set<() => void>();
@@ -19,11 +20,16 @@ export class Store<T> implements StoreHandler {
   private _localKey: string | null;
   private _localTimer: ReturnType<typeof setTimeout> | null = null;
   private _readyResolve!: () => void;
-  readonly ready: Promise<void>;
+  ready: Promise<void>;
 
   // ── debounced flush ──────────────────────────────────────────────
+  // Leading + trailing semantics: the first write in an idle period fires
+  // immediately and arms a cooldown timer of `delay` ms. Writes that arrive
+  // during the cooldown are coalesced and flushed once when the timer
+  // expires. If the timer expires with no calls in-window, no trailing fire.
   private _defaultDebounce: number;
   private _flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private _pendingTrailing = false;
   private _flushWaiters: Array<{
     resolve: () => void;
     reject: (e: Error) => void;
@@ -42,6 +48,7 @@ export class Store<T> implements StoreHandler {
     this._name = name;
     this._serializer = serializer;
     this._localKey = localKey ?? null;
+    this._default = defaultValue;
     this._value = defaultValue;
     this._defaultDebounce = defaultDebounce ?? 0;
 
@@ -76,7 +83,7 @@ export class Store<T> implements StoreHandler {
       this._saveLocalDebounced();
       return this._scheduleFlush(debounce);
     }
-    const data = this._serializer.encode(value);
+    const data = await this._serializer.encode(value);
     await this._pico._exec(this._pico._encoder.set(this._name, data));
   }
 
@@ -115,7 +122,7 @@ export class Store<T> implements StoreHandler {
     if (resp.version > this._version) {
       let value: T;
       try {
-        value = this._serializer.decode(resp.data);
+        value = await this._serializer.decode(resp.data);
       } catch (_) {
         // Server data is corrupt — try to heal with local state
         this._selfHeal();
@@ -136,26 +143,35 @@ export class Store<T> implements StoreHandler {
     this._notify();
   }
 
-  /** Force any pending debounced write to flush now. */
+  /** Force any pending debounced trailing write to flush now. */
   async flush(): Promise<void> {
     if (this._flushTimer === null) return;
     clearTimeout(this._flushTimer);
     this._flushTimer = null;
+    if (!this._pendingTrailing) {
+      // Nothing accumulated during the window — leading already covered it.
+      return;
+    }
+    this._pendingTrailing = false;
     await this._doFlush();
   }
 
   private _scheduleFlush(delay: number): Promise<void> {
+    if (this._flushTimer === null) {
+      // Leading edge: arm cooldown, fire current value now.
+      this._flushTimer = setTimeout(() => {
+        this._flushTimer = null;
+        if (this._pendingTrailing) {
+          this._pendingTrailing = false;
+          this._doFlush();
+        }
+      }, delay);
+      return this._doFlush();
+    }
+    // Within cooldown: queue for the trailing flush.
+    this._pendingTrailing = true;
     return new Promise<void>((resolve, reject) => {
       this._flushWaiters.push({ resolve, reject });
-      // Arm only if no timer is already running. A burst of writes
-      // joins the existing window so we always flush at most once
-      // per `delay`, even under continuous load.
-      if (this._flushTimer === null) {
-        this._flushTimer = setTimeout(() => {
-          this._flushTimer = null;
-          this._doFlush();
-        }, delay);
-      }
     });
   }
 
@@ -167,7 +183,7 @@ export class Store<T> implements StoreHandler {
       return;
     }
     try {
-      const data = this._serializer.encode(this._value);
+      const data = await this._serializer.encode(this._value);
       await this._pico._exec(this._pico._encoder.set(this._name, data));
       for (const w of waiters) w.resolve();
     } catch (err) {
@@ -181,21 +197,24 @@ export class Store<T> implements StoreHandler {
       clearTimeout(this._flushTimer);
       this._flushTimer = null;
     }
+    this._pendingTrailing = false;
     const waiters = this._flushWaiters;
     this._flushWaiters = [];
     for (const w of waiters) w.resolve();
   }
 
   /** @internal */
-  _onUpdate(data: Uint8Array<ArrayBufferLike>, version: number) {
+  async _onUpdate(data: Uint8Array<ArrayBufferLike>, version: number) {
     if (version <= this._version) return;
     let value: T;
     try {
-      value = this._serializer.decode(data);
+      value = await this._serializer.decode(data);
     } catch (_) {
       this._selfHeal();
       return;
     }
+    // Re-check after await — a newer update may have arrived
+    if (version <= this._version) return;
     this._version = version;
     this._value = value;
     this._notify();
@@ -233,25 +252,83 @@ export class Store<T> implements StoreHandler {
     this._serverSubscribe();
   }
 
+  /** @internal */
+  _switchNamespace(newNamespace: string) {
+    this._cancelFlush();
+    if (this._localTimer !== null) {
+      clearTimeout(this._localTimer);
+      this._localTimer = null;
+    }
+    if (this._localKey) {
+      this._localKey = `__pico_local_${newNamespace}_${this._name}`;
+    }
+    this._version = 0;
+    this._value = this._default;
+    this._serverSubscribed = false;
+    this.ready = new Promise((r) => {
+      this._readyResolve = r;
+    });
+    if (this._localKey) this._loadLocal();
+    this._notify();
+  }
+
   private _loadLocal() {
     if (!this._localKey || typeof globalThis.localStorage === "undefined")
       return;
+    let entry: { v: number; d: string };
+    let data: Uint8Array;
     try {
       const raw = localStorage.getItem(this._localKey);
       if (!raw) return;
-      const entry = JSON.parse(raw) as { v: number; d: string };
-      const data = base64ToUint8(entry.d);
-      this._version = entry.v;
-      this._value = this._serializer.decode(data);
+      entry = JSON.parse(raw) as { v: number; d: string };
+      data = base64ToUint8(entry.d);
     } catch (err) {
       console.warn(
-        `[pico] failed to load local cache for "${this._name}":`,
+        `[pico] failed to read local cache for "${this._name}":`,
         err,
       );
+      return;
+    }
+
+    // Synchronous fast path so initial render sees the cached value
+    // without a microtask gap. Async decoders (e.g. Encrypted) take the
+    // promise branch and notify subscribers when they resolve.
+    let result: T | Promise<T>;
+    try {
+      result = this._serializer.decode(data);
+    } catch (err) {
+      console.warn(
+        `[pico] failed to decode local cache for "${this._name}":`,
+        err,
+      );
+      return;
+    }
+
+    const apply = (value: T, notify: boolean) => {
+      // Don't clobber a newer value loaded from the server in the meantime
+      if (entry.v <= this._version) return;
+      this._version = entry.v;
+      this._value = value;
+      if (notify) this._notify();
+    };
+
+    if (result instanceof Promise) {
+      result.then(
+        (v) => apply(v, true),
+        (err) =>
+          console.warn(
+            `[pico] failed to decode local cache for "${this._name}":`,
+            err,
+          ),
+      );
+    } else {
+      // Sync — happens inside the constructor (or _switchNamespace), so
+      // skip notify; the caller does it / there are no subscribers yet.
+      apply(result, false);
     }
   }
 
-  private _saveLocal() {
+  private async _saveLocal() {
     if (
       !this._localKey ||
       this._value === undefined ||
@@ -259,7 +336,7 @@ export class Store<T> implements StoreHandler {
     )
       return;
     try {
-      const data = this._serializer.encode(this._value);
+      const data = await this._serializer.encode(this._value);
       const entry = JSON.stringify({
         v: this._version,
         d: uint8ToBase64(data),
@@ -293,10 +370,13 @@ export class Store<T> implements StoreHandler {
   private _selfHeal() {
     if (this._value !== undefined) {
       // Push last known good value to server
-      const data = this._serializer.encode(this._value);
-      this._pico
-        ._execOk(this._pico._encoder.set(this._name, data))
-        .catch(() => {});
+      const value = this._value;
+      (async () => {
+        try {
+          const data = await this._serializer.encode(value);
+          await this._pico._execOk(this._pico._encoder.set(this._name, data));
+        } catch (_) {}
+      })();
     }
     // If no local value, nothing to recover from — leave as-is.
   }

@@ -3,6 +3,8 @@ import { Pico } from "./client.js";
 import { Store } from "./store.js";
 import { ListStore } from "./list-store.js";
 import { MapStore } from "./map-store.js";
+import { MultiStore } from "./multistore.js";
+import { resolveName, type NameFn } from "./factory-internal.js";
 import type {
   PicoOptions,
   StoreOptions,
@@ -10,6 +12,8 @@ import type {
   MapStoreOptions,
   Serializer,
 } from "./types.js";
+
+export type { NameFn };
 
 export type {
   PicoOptions,
@@ -188,6 +192,114 @@ export function usePicoMapStore<V>(
   options?: MapStoreOptions<V>,
 ): PicoMapStore<V> {
   return usePico().map<V>(name, options);
+}
+
+// ── Stores-context (user-defined ctx for store-name templating) ────
+
+const STORES_CTX_KEY = Symbol("pico-stores-ctx");
+
+export function setStoresContext<C>(ctx: C): C {
+  setContext(STORES_CTX_KEY, ctx);
+  return ctx;
+}
+
+export function useStoresContext<C = unknown>(): C {
+  // `void` ctx (no metadata needed) is allowed — return undefined as C.
+  return getContext<C>(STORES_CTX_KEY);
+}
+
+// ── createStoreFactory<Ctx>() ──────────────────────────────────────
+//
+// Returns six `define*` callables. Each accepts a name (string or
+// `(ctx, ...args) => string`) and store options, and returns a hook
+// `(...args) => Wrapper`. The wrapper is the same instance the existing
+// `usePico*Store` hooks return — pulled from the per-namespace cache on
+// the `PicoInstance`, so repeat calls (across components) share the
+// same subscription.
+
+export function createStoreFactory<Ctx = void>() {
+  function defineStore<T, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options: StoreOptions<T> & { default: T },
+  ): (...args: A) => PicoStore<T>;
+  function defineStore<T, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: StoreOptions<T>,
+  ): (...args: A) => PicoStore<T | undefined>;
+  function defineStore<T, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: StoreOptions<T>,
+  ): (...args: A) => PicoStore<T | undefined> {
+    return (...args: A) =>
+      usePico().store<T>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options as StoreOptions<T>,
+      );
+  }
+
+  function defineList<T, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: CollectionStoreOptions<T>,
+  ): (...args: A) => PicoListStore<T> {
+    return (...args: A) =>
+      usePico().list<T>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  function defineMap<V, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: MapStoreOptions<V>,
+  ): (...args: A) => PicoMapStore<V> {
+    return (...args: A) =>
+      usePico().map<V>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  function defineMultiStore<V, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: { serializer?: Serializer<V>; local?: boolean },
+  ): (...args: A) => MultiStore<V, "store"> {
+    return (...args: A) =>
+      usePico().pico.multistore<V>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  function defineMultiList<V, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: { serializer?: Serializer<V[]>; local?: boolean },
+  ): (...args: A) => MultiStore<V, "list"> {
+    return (...args: A) =>
+      usePico().pico.multilist<V>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  function defineMultiMap<V, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: { serializer?: Serializer<V>; local?: boolean },
+  ): (...args: A) => MultiStore<V, "map"> {
+    return (...args: A) =>
+      usePico().pico.multimap<V>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  return {
+    defineStore,
+    defineList,
+    defineMap,
+    defineMultiStore,
+    defineMultiList,
+    defineMultiMap,
+  };
 }
 
 export class PicoListStore<T> {

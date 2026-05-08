@@ -11,6 +11,8 @@ import { Pico } from "./client.js";
 import { Store } from "./store.js";
 import { ListStore } from "./list-store.js";
 import { MapStore } from "./map-store.js";
+import { MultiStore } from "./multistore.js";
+import { resolveName, type NameFn } from "./factory-internal.js";
 import type {
   PicoOptions,
   StoreOptions,
@@ -21,6 +23,8 @@ import type {
   ReadonlyListStore,
   ReadonlyMapStore,
 } from "./types.js";
+
+export type { NameFn };
 
 export type {
   PicoOptions,
@@ -53,12 +57,14 @@ export function PicoProvider({
 
   useEffect(() => {
     const pico = picoRef.current!;
-    // Swallow the initial-connect rejection — reconnect logic will keep
-    // trying in the background, and consumers observe state via
-    // `usePicoConnection()`.
-    pico.connect().catch(() => {});
-    return () => pico.close();
-  }, []);
+    // Swallow rejections — reconnect logic keeps trying in the
+    // background, and consumers observe state via `usePicoConnection()`.
+    // `switchNamespace` short-circuits if the namespace is unchanged, so
+    // it's safe for the initial mount too.
+    pico.switchNamespace(namespace).catch(() => {});
+  }, [namespace]);
+
+  useEffect(() => () => picoRef.current?.close(), []);
 
   return createElement(
     PicoContext.Provider,
@@ -158,11 +164,14 @@ export function usePicoStore<T>(
   store: Store<T>,
 ] {
   const pico = usePico();
-  const ref = useRef<OptimisticStore<T> | null>(null);
-  if (!ref.current) {
-    ref.current = new OptimisticStore(pico.store<T>(name, options));
+  const ref = useRef<{ name: string; os: OptimisticStore<T> } | null>(null);
+  if (!ref.current || ref.current.name !== name) {
+    ref.current = {
+      name,
+      os: new OptimisticStore(pico.store<T>(name, options)),
+    };
   }
-  const os = ref.current;
+  const os = ref.current.os;
 
   const sub = useCallback(
     (onStoreChange: () => void) => os.subscribe(onStoreChange),
@@ -209,11 +218,11 @@ export function usePicoListStore<T>(
   options?: CollectionStoreOptions<T>,
 ): PicoListHookResult<T> {
   const pico = usePico();
-  const ref = useRef<ListStore<T> | null>(null);
-  if (!ref.current) {
-    ref.current = pico.list<T>(name, options);
+  const ref = useRef<{ name: string; store: ListStore<T> } | null>(null);
+  if (!ref.current || ref.current.name !== name) {
+    ref.current = { name, store: pico.list<T>(name, options) };
   }
-  const store = ref.current;
+  const store = ref.current.store;
 
   const sub = useCallback(
     (onStoreChange: () => void) => {
@@ -270,11 +279,11 @@ export function usePicoMapStore<V>(
   options?: MapStoreOptions<V>,
 ): PicoMapHookResult<V> {
   const pico = usePico();
-  const ref = useRef<MapStore<V> | null>(null);
-  if (!ref.current) {
-    ref.current = pico.map<V>(name, options);
+  const ref = useRef<{ name: string; store: MapStore<V> } | null>(null);
+  if (!ref.current || ref.current.name !== name) {
+    ref.current = { name, store: pico.map<V>(name, options) };
   }
-  const store = ref.current;
+  const store = ref.current.store;
 
   const sub = useCallback(
     (onStoreChange: () => void) => {
@@ -340,6 +349,122 @@ export function useReadonlyPicoMapStore<V>(
   options?: MapStoreOptions<V>,
 ): ReadonlyMapStore<V> {
   return usePicoMapStore<V>(name, options).store;
+}
+
+// ── Stores-context (user-defined ctx for store-name templating) ────
+
+const StoresContext = createContext<unknown>(undefined);
+
+export function StoresProvider<C>({
+  ctx,
+  children,
+}: {
+  ctx: C;
+  children: React.ReactNode;
+}) {
+  return createElement(StoresContext.Provider, { value: ctx }, children);
+}
+
+export function useStoresContext<C = unknown>(): C {
+  return useContext(StoresContext) as C;
+}
+
+// ── createStoreFactory<Ctx>() ──────────────────────────────────────
+//
+// Returns six `define*` callables. Each takes a name (string or
+// `(ctx, ...args) => string`) and store options, and returns a hook
+// that resolves the name against `useStoresContext()` and delegates to
+// the existing `usePico*Store` hooks.
+
+export function createStoreFactory<Ctx = void>() {
+  function defineStore<T, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options: StoreOptions<T> & { default: T },
+  ): (
+    ...args: A
+  ) => [value: T, set: (value: T | ((prev: T) => T)) => void, store: Store<T>];
+  function defineStore<T, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: StoreOptions<T>,
+  ): (...args: A) => [
+    value: T | undefined,
+    set: (value: T | ((prev: T | undefined) => T)) => void,
+    store: Store<T>,
+  ];
+  function defineStore<T, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: StoreOptions<T>,
+  ) {
+    return (...args: A) =>
+      usePicoStore<T>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options as StoreOptions<T>,
+      );
+  }
+
+  function defineList<T, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: CollectionStoreOptions<T>,
+  ): (...args: A) => PicoListHookResult<T> {
+    return (...args: A) =>
+      usePicoListStore<T>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  function defineMap<V, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: MapStoreOptions<V>,
+  ): (...args: A) => PicoMapHookResult<V> {
+    return (...args: A) =>
+      usePicoMapStore<V>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  function defineMultiStore<V, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: { serializer?: Serializer<V>; local?: boolean },
+  ): (...args: A) => MultiStore<V, "store"> {
+    return (...args: A) =>
+      usePico().multistore<V>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  function defineMultiList<V, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: { serializer?: Serializer<V[]>; local?: boolean },
+  ): (...args: A) => MultiStore<V, "list"> {
+    return (...args: A) =>
+      usePico().multilist<V>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  function defineMultiMap<V, A extends unknown[] = []>(
+    name: NameFn<Ctx, A>,
+    options?: { serializer?: Serializer<V>; local?: boolean },
+  ): (...args: A) => MultiStore<V, "map"> {
+    return (...args: A) =>
+      usePico().multimap<V>(
+        resolveName(name, useStoresContext<Ctx>(), args),
+        options,
+      );
+  }
+
+  return {
+    defineStore,
+    defineList,
+    defineMap,
+    defineMultiStore,
+    defineMultiList,
+    defineMultiMap,
+  };
 }
 
 export function usePicoConnection(): boolean {
